@@ -7,21 +7,29 @@
 // +----------------------------------------------------------------------
 // | @Environment: PHP 7.4.33 + PHPMyAdmin 5.2.2 on Windows Platform
 // | @Author:  Jack Wang <jack10082009@GitHub>
-// | @Date:    2025-04-09 00:39:00 +0800
-// | @Version: 1.0.0
+// | @Date:    2025-11-03 16:30:00 +0800
+// | @Version: 1.1.0
 // | @License: MIT
 // +----------------------------------------------------------------------
 #include <windows.h>
+#include <shellapi.h>
 #include <string>
 #include <fstream>
 #include <sstream>
 #include <cstdlib>
 #include <tlhelp32.h>
 #pragma execution_character_set("utf-8")
+#define IDI_ICON1 101
 static HINSTANCE hInst;
 static HWND hStatusText;
+static HWND hMainWnd;
 static PROCESS_INFORMATION piServer;
+static NOTIFYICONDATAW nid;
 int PORT = 7000;
+#define WM_TRAYICON (WM_USER + 1)
+#define ID_TRAY_RESTORE 1001
+#define ID_TRAY_OPEN_REPO 1003
+#define ID_TRAY_EXIT 1002
 /**
  * 检索 PHP 可执行文件路径
  * Retrieves the PHP executable path
@@ -100,6 +108,48 @@ bool StartPHPServer(int& port) {
 	return false;
 }
 /**
+ * 添加托盘图标
+ * Adds a tray icon
+ * @param hWnd The window handle.
+ * @return true if successful, false otherwise.
+ */
+bool AddTrayIcon(HWND hWnd) {
+	ZeroMemory(&nid, sizeof(NOTIFYICONDATAW));
+	nid.cbSize = sizeof(NOTIFYICONDATAW);
+	nid.hWnd = hWnd;
+	nid.uID = 1;
+	nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+	nid.uCallbackMessage = WM_TRAYICON;
+	nid.hIcon = LoadIcon(hInst, MAKEINTRESOURCE(IDI_ICON1));
+	wcscpy_s(nid.szTip, L"PHPMyAdmin Desktop Launcher");
+	return Shell_NotifyIconW(NIM_ADD, &nid);
+}
+/**
+ * 移除托盘图标
+ * Removes the tray icon
+ */
+void RemoveTrayIcon() {
+	Shell_NotifyIconW(NIM_DELETE, &nid);
+}
+/**
+ * 显示托盘菜单
+ * Shows the tray menu
+ * @param hWnd The window handle.
+ */
+void ShowTrayMenu(HWND hWnd) {
+	POINT pt;
+	GetCursorPos(&pt);
+	HMENU hMenu = CreatePopupMenu();
+	AppendMenuW(hMenu, MF_STRING, ID_TRAY_RESTORE, L"恢复窗口/Restore");
+	AppendMenuW(hMenu, MF_STRING, ID_TRAY_OPEN_REPO, L"打开仓库/Open Repository");
+	AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
+	AppendMenuW(hMenu, MF_STRING, ID_TRAY_EXIT, L"退出/Exit");
+	SetForegroundWindow(hWnd);
+	TrackPopupMenu(hMenu, TPM_LEFTALIGN | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hWnd, NULL);
+	PostMessage(hWnd, WM_NULL, 0, 0);
+	DestroyMenu(hMenu);
+}
+/**
  * 递归终止进程树
  * Recursively terminates the process tree
  * @param pid The process ID to terminate.
@@ -146,6 +196,57 @@ void OpenBrowser(const std::wstring& browser, bool appMode, bool incognito = fal
 		if(incognito){args = L"-private-window " + args;}
 	}
 	ShellExecuteW(NULL, L"open", browser.c_str(), args.c_str(), NULL, SW_SHOWNORMAL);
+}
+/**
+ * 解析命令行参数中的option值
+ * Parses the option value from command line arguments
+ * @param cmdLine The command line string.
+ * @return The option value (1-8), or 0 if invalid or not found.
+ */
+int ParseOptionFromCmdLine(LPSTR cmdLine) {
+	if(!cmdLine || strlen(cmdLine) == 0) return 0;
+	std::string cmd(cmdLine);
+	size_t pos = cmd.find("-option=");
+	if(pos == std::string::npos) return 0;
+	pos += 8;
+	if(pos >= cmd.length()) return 0;
+	int option = 0;
+	while(pos < cmd.length() && cmd[pos] >= '0' && cmd[pos] <= '9'){
+		option = option * 10 + (cmd[pos] - '0');
+		pos++;
+	}
+	if(option >= 1 && option <= 8){return option;}
+	return 0;
+}
+/**
+ * 检测命令行参数中是否包含-mini
+ * Checks if the command line arguments contain -mini
+ * @param cmdLine The command line string.
+ * @return true if -mini is found, false otherwise.
+ */
+bool ParseMiniFromCmdLine(LPSTR cmdLine) {
+	if(!cmdLine || strlen(cmdLine) == 0) return false;
+	std::string cmd(cmdLine);
+	return cmd.find("-mini") != std::string::npos;
+}
+/**
+ * 根据option参数打开对应的浏览器
+ * Opens the corresponding browser based on the option parameter
+ * @param option The option value (1-8).
+ * @return true if the option is valid and browser is opened, false otherwise.
+ */
+bool OpenBrowserByOption(int option) {
+	switch(option){
+		case 1: OpenBrowser(L"chrome.exe", true); return true;          // Chrome-APP
+		case 2: OpenBrowser(L"chrome.exe", false); return true;         // Chrome
+		case 3: OpenBrowser(L"chrome.exe", false, true); return true;   // Chrome-Incognito
+		case 4: OpenBrowser(L"msedge.exe", true); return true;          // Edge-APP
+		case 5: OpenBrowser(L"msedge.exe", false); return true;         // Edge
+		case 6: OpenBrowser(L"msedge.exe", false, true); return true;   // Edge-InPrivate
+		case 7: OpenBrowser(L"firefox.exe", false); return true;        // Firefox
+		case 8: OpenBrowser(L"firefox.exe", false, true); return true;  // Firefox-Private
+		default: return false;  // 无效选项/Invalid option
+	}
 }
 /**
  * 窗口过程函数
@@ -195,20 +296,35 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
 		}
 		case WM_COMMAND: {
 			int wmId = LOWORD(wParam);
-			switch (wmId) {
-				case 1: OpenBrowser(L"chrome.exe", true); break;
-				case 2: OpenBrowser(L"chrome.exe", false); break;
-				case 3: OpenBrowser(L"msedge.exe", true); break;
-				case 4: OpenBrowser(L"msedge.exe", false); break;
-				case 5: OpenBrowser(L"chrome.exe", false, true); break;
-				case 6: OpenBrowser(L"msedge.exe", false, true); break;
-				case 7: OpenBrowser(L"firefox.exe", false); break;
-				case 8: OpenBrowser(L"firefox.exe", false, true); break;
-				case 99: DestroyWindow(hWnd); break;
+			if(wmId == 99 || wmId == ID_TRAY_EXIT){
+				DestroyWindow(hWnd);
+			}else if(wmId == ID_TRAY_RESTORE){
+				ShowWindow(hWnd, SW_RESTORE);
+				SetForegroundWindow(hWnd);
+			}else if(wmId == ID_TRAY_OPEN_REPO){
+				ShellExecuteW(NULL, L"open", L"https://github.com/jack10082009/PHPMyAdmin-Desktop-Launcher", NULL, NULL, SW_SHOWNORMAL);
+			}else{
+				OpenBrowserByOption(wmId);
+			}
+			break;
+		}
+		case WM_SIZE: {
+			if(wParam == SIZE_MINIMIZED){
+				ShowWindow(hWnd, SW_HIDE);
+			}
+			break;
+		}
+		case WM_TRAYICON: {
+			if(lParam == WM_LBUTTONDBLCLK){
+				ShowWindow(hWnd, SW_RESTORE);
+				SetForegroundWindow(hWnd);
+			}else if(lParam == WM_RBUTTONUP){
+				ShowTrayMenu(hWnd);
 			}
 			break;
 		}
 		case WM_DESTROY: {
+			RemoveTrayIcon();
 			KillProcessTree(piServer.dwProcessId);
 			CloseHandle(piServer.hProcess);
 			CloseHandle(piServer.hThread);
@@ -231,6 +347,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
  */
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
 	hInst = hInstance;
+	int autoOption = ParseOptionFromCmdLine(lpCmdLine);
+	bool autoMini = ParseMiniFromCmdLine(lpCmdLine);
 	if(!UpdatePHPConfig()){
 		MessageBoxW(NULL, L"无法更新PHP配置。/Unable to update PHP configuration", L"错误/Error", MB_ICONERROR);
 		return 1;
@@ -243,6 +361,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 	wcex.lpfnWndProc = WndProc;
 	wcex.hInstance = hInstance;
 	wcex.hCursor = LoadCursor(nullptr, IDC_ARROW);
+	wcex.hIcon = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_ICON1));
+	wcex.hIconSm = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_ICON1));
 	wcex.lpszClassName = L"PHPMyAdminLauncher";
 	RegisterClassExW(&wcex);
 	HWND hWnd = CreateWindowW(
@@ -252,13 +372,27 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 		CW_USEDEFAULT, 0, 360, 160,
 		nullptr, nullptr, hInstance, nullptr
 		);
-	ShowWindow(hWnd, nCmdShow);
+	hMainWnd = hWnd;
+	AddTrayIcon(hWnd);
+	// 如果有-mini参数，自动隐藏窗口
+	// If -mini parameter is present, automatically hide the window
+	if(autoMini){
+		ShowWindow(hWnd, SW_HIDE);
+	}else{
+		ShowWindow(hWnd, nCmdShow);
+	}
 	UpdateWindow(hWnd);
 	if(hStatusText){
 		std::wstring msg = (piServer.dwProcessId != 0) ?
 		L"http://localhost:" + std::to_wstring(PORT) :
 		L"启动失败/Launch failed";
 		SetWindowTextW(hStatusText, msg.c_str());
+	}
+	// 如果服务器启动成功并且有有效的option参数，自动打开浏览器
+	// If the server started successfully and there's a valid option parameter, auto-open browser
+	if(piServer.dwProcessId != 0 && autoOption >= 1 && autoOption <= 8){
+		Sleep(500);
+		OpenBrowserByOption(autoOption);
 	}
 	MSG msg;
 	while(GetMessage(&msg, nullptr, 0, 0)){
